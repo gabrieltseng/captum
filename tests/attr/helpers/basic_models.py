@@ -301,3 +301,24 @@ class BasicModel_ConvNet_MaxPool3d(nn.Module):
         x = self.relu3(self.fc1(x))
         x = self.fc2(x)
         return self.softmax(x)
+
+
+class BasicDeepLIFTModel(nn.Module):
+    """
+        Example network from
+        https://arxiv.org/abs/1704.02685
+    """
+    def __init__(self):
+        super().__init__()
+        self.relu = nn.ReLU()
+
+        self.sum1 = nn.Linear(2, 1, bias=False)
+        self.sum1.weight = nn.Parameter(torch.tensor([[1., 1.]]))
+
+        self.sum2 = nn.Linear(2, 1, bias=False)
+        self.sum2.weight = nn.Parameter(torch.tensor([[1., 1.]]))
+
+    def forward(self, i1, i2):
+        h1 = self.sum1(torch.cat((i1, i2), dim=-1))
+        h2 = self.relu(h1)
+        return self.sum2(torch.cat((i1, h2), dim=-1))

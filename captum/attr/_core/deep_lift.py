@@ -32,7 +32,7 @@ def _check_valid_module(inputs, outputs):
 
 
 class DeepLift(GradientAttribution):
-    def __init__(self, model):
+    def __init__(self, model, reveal_cancel=False):
         r"""
         Args:
 
@@ -40,8 +40,13 @@ class DeepLift(GradientAttribution):
         """
         super().__init__(model)
         self.model = model
+        self.reveal_cancel = reveal_cancel
         self.forward_handles = []
         self.backward_handles = []
+
+        # used by reveal cancel to dynamically turn the forward hook
+        # on and off
+        self.use_forward_hook = True
 
     def attribute(
         self,
@@ -183,6 +188,12 @@ class DeepLift(GradientAttribution):
 
         validate_input(inputs, baselines)
 
+        if self.reveal_cancel:
+            # two batches of gradients are going to be calculated - one batch
+            # to keep track of positive contributions, one batch to keep track
+            # of negative contributions
+            inputs = tuple(i.repeat(2, *[1 for _ in range(1, len(i.shape))]) for i in inputs)
+
         # set hooks for baselines
         self._traverse_modules(self.model, self._register_hooks, input_type="ref")
         # make forward pass and remove baseline hooks
@@ -201,6 +212,12 @@ class DeepLift(GradientAttribution):
             target_ind=target,
             additional_forward_args=additional_forward_args,
         )
+
+        if self.reveal_cancel:
+            # sum the positive and negative attributions
+            gradients = (torch.add(*torch.chunk(g, 2)) for g in gradients)
+            # both chunks of the inputs are identical
+            inputs = tuple(torch.chunk(i, 2)[0] for i in inputs)
         attributions = tuple(
             (input - baseline) * gradient
             for input, baseline, gradient in zip(inputs, baselines, gradients)
@@ -225,34 +242,62 @@ class DeepLift(GradientAttribution):
         else:
             return _format_attributions(is_inputs_tuple, attributions)
 
-    def _is_non_linear(self, module):
+    def _requires_multiplier(self, module):
+        if self.reveal_cancel:
+            return (type(module) in SUPPORTED_NON_LINEAR.keys()) or \
+                   (type(module) in SUPPORTED_LINEAR.keys())
         return type(module) in SUPPORTED_NON_LINEAR.keys()
+
+    def _reveal_cancel(self, module, input, baseline):
+        self.use_forward_hook = False
+        pos_in, neg_in = input.chunk(2)
+        pos_in = torch.where(pos_in > 0, pos_in, torch.zeros_like(pos_in))
+        neg_in = torch.where(neg_in < 0, neg_in, torch.zeros_like(neg_in))
+
+        delta_in = torch.cat((pos_in - baseline, neg_in - baseline), dim=0)
+        with torch.no_grad():
+            # this was screwing things up
+            pos_out = 0.5 * (module(baseline + pos_in) - module(baseline) +
+                             module(baseline + pos_in + neg_in) - module(baseline + neg_in))
+            neg_out = 0.5 * (module(baseline + neg_in) - module(baseline) +
+                             module(baseline + pos_in + neg_in) - module(baseline + pos_in))
+        delta_out = torch.cat((pos_out, neg_out), dim=0)
+        self.use_forward_hook = True
+        return delta_in, delta_out
 
     # we need forward hook to access and detach the inputs and outputs of a neuron
     def _forward_hook(self, module, inputs, outputs):
-        input_attr_name = "input"
-        output_attr_name = "output"
-        self._detach_tensors(input_attr_name, output_attr_name, module, inputs, outputs)
-        if not _check_valid_module(inputs, outputs):
-            module.is_invalid = True
-            module.saved_grad = None
+        if self.use_forward_hook:
+            if self.reveal_cancel:
+                inputs, outputs_rc = self._reveal_cancel(module, inputs[0], module.input_ref[0])
+                # by writing only the data, we preserve the grad_fn so the check in _check_valid_module
+                # still works
+                outputs.data = outputs_rc
+            input_attr_name = "input"
+            output_attr_name = "output"
+            self._detach_tensors(input_attr_name, output_attr_name, module, inputs, outputs)
+            if not _check_valid_module(inputs, outputs):
+                module.is_invalid = True
+                module.saved_grad = None
 
-            def tensor_backward_hook(grad):
-                if module.saved_grad is None:
-                    raise RuntimeError(
-                        """Module {} was detected as not supporting correctly module
-                        backward hook. You should modify your hook to ignore the given
-                        grad_inputs (recompute them by hand if needed) and save the
-                        newly computed grad_inputs in module.saved_grad. See MaxPool1d
-                        as an example.""".format(
-                            module
+                def tensor_backward_hook(grad):
+                    if module.saved_grad is None:
+                        raise RuntimeError(
+                            """Module {} was detected as not supporting correctly module
+                            backward hook. You should modify your hook to ignore the given
+                            grad_inputs (recompute them by hand if needed) and save the
+                            newly computed grad_inputs in module.saved_grad. See MaxPool1d
+                            as an example.""".format(
+                                module
+                            )
                         )
-                    )
-                return module.saved_grad
+                    return module.saved_grad
 
-            inputs[0].register_hook(tensor_backward_hook)
-        else:
-            module.is_invalid = False
+                inputs[0].register_hook(tensor_backward_hook)
+            else:
+                module.is_invalid = False
+            if self.reveal_cancel:
+                return outputs
 
     def _forward_hook_ref(self, module, inputs, outputs):
         input_attr_name = "input_ref"
@@ -280,14 +325,21 @@ class DeepLift(GradientAttribution):
          `grad_output` * delta_out / delta_in.
 
          """
-        delta_in = tuple(
-            inp - inp_ref for inp, inp_ref in zip(module.input, module.input_ref)
-        )
-        delta_out = tuple(
-            out - out_ref for out, out_ref in zip(module.output, module.output_ref)
-        )
+        if self.reveal_cancel:
+            delta_in, delta_out = module.input, module.output
+        else:
+            delta_in = tuple(
+                inp - inp_ref for inp, inp_ref in zip(module.input, module.input_ref)
+            )
+            delta_out = tuple(
+                out - out_ref for out, out_ref in zip(module.output, module.output_ref)
+            )
+        if self.reveal_cancel:
+            supported_modules = {**SUPPORTED_NON_LINEAR, **SUPPORTED_LINEAR}
+        else:
+            supported_modules = SUPPORTED_NON_LINEAR
         multipliers = tuple(
-            SUPPORTED_NON_LINEAR[type(module)](
+            supported_modules[type(module)](
                 module, delta_in, delta_out, list(grad_input), grad_output, eps=eps
             )
         )
@@ -296,7 +348,6 @@ class DeepLift(GradientAttribution):
         del module.output_ref
         del module.input
         del module.output
-
         return multipliers
 
     def _register_hooks(self, module, input_type="non_ref"):
@@ -306,7 +357,7 @@ class DeepLift(GradientAttribution):
         if (
             "nn.modules.container" in module_fullname
             or has_already_hooks
-            or not self._is_non_linear(module)
+            or not self._requires_multiplier(module)
         ):
             return
         # adds forward hook to leaf nodes that are non-linear
@@ -342,8 +393,8 @@ class DeepLift(GradientAttribution):
 
 
 class DeepLiftShap(DeepLift):
-    def __init__(self, model):
-        super().__init__(model)
+    def __init__(self, model, reveal_cancel=False):
+        super().__init__(model, reveal_cancel=reveal_cancel)
 
     def attribute(
         self,
@@ -525,6 +576,38 @@ class DeepLiftShap(DeepLift):
             return _format_attributions(is_inputs_tuple, attributions)
 
 
+def linear(module, delta_in, delta_out, grad_input, grad_output, eps=1e-10):
+    pos_in, neg_in = torch.chunk(delta_in[0], 2)
+    grad_out_pos, grad_out_neg = torch.chunk(grad_output[0], 2)
+
+    pos_in_ones = torch.where(pos_in > 0, torch.ones_like(pos_in), torch.zeros_like(pos_in))
+    neg_in_ones = torch.where(neg_in < 0, torch.ones_like(neg_in), torch.zeros_like(neg_in))
+
+    weight = module.weight
+    weight_lt = torch.where(weight < 0, weight, torch.zeros_like(weight))
+    weight_gt = torch.where(weight > 0, weight, torch.zeros_like(weight))
+
+    m_if_zero = torch.where(
+        pos_in + neg_in == 0,
+        torch.matmul(0.5 * (grad_out_pos + grad_out_neg), weight),
+        torch.zeros_like(weight))
+
+    multiplier_pos = torch.where(
+        (pos_in + neg_in > 0),
+        (torch.matmul(grad_out_pos, weight_gt) * pos_in_ones) +
+        (torch.matmul(grad_out_neg, weight_lt) * pos_in_ones),
+        torch.zeros_like(pos_in_ones)
+    ) + m_if_zero
+    multiplier_neg = torch.where(
+        (pos_in + neg_in < 0),
+        (torch.matmul(grad_out_pos, weight_lt) * neg_in_ones) +
+        (torch.matmul(grad_out_neg, weight_gt) * neg_in_ones),
+        torch.zeros_like(neg_in_ones)
+    ) + m_if_zero
+    grad_input[0] = torch.cat((multiplier_pos, multiplier_neg), dim=0)
+    return grad_input
+
+
 def nonlinear(module, delta_in, delta_out, grad_input, grad_output, eps=1e-10):
     r"""
     grad_input: (dLoss / dprev_layer_out, dLoss / wij, dLoss / bij)
@@ -657,4 +740,10 @@ SUPPORTED_NON_LINEAR = {
     nn.MaxPool2d: maxpool2d,
     nn.MaxPool3d: maxpool3d,
     nn.Softmax: softmax,
+}
+
+# the reveal-cancel rule applies to linear
+# modules as well
+SUPPORTED_LINEAR = {
+    nn.Linear: linear
 }
